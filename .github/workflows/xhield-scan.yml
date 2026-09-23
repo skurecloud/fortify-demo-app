@@ -1,0 +1,104 @@
+# xhield-scan for GitHub Actions.
+#
+# Copy to .github/workflows/xhield-scan.yml in the repository to be scanned.
+#
+# What it does: downloads a pinned xhield-scan jar, verifies its checksum, scans the checkout, and
+# uploads SARIF so findings appear as code scanning annotations on the pull request. The build
+# fails when a finding at or above XHIELD_FAIL_ON is reachable or its reachability could not be
+# determined; a finding the call graph measured as unreachable is annotated but does not block.
+#
+# What leaves the runner: the SARIF file, uploaded to GitHub code scanning - findings, file paths,
+# line numbers and the one-line snippet each finding points at. Nothing else. The scan itself makes
+# no network calls; the only other network access is the jar download below.
+#
+# Requirements:
+#   - Code scanning must be available for the repository: free on public repositories; on private
+#     ones it needs GitHub Code Security (Advanced Security). Without it the upload step fails, and
+#     the gate below still decides the build.
+#   - Pull requests from forks receive a read-only token, so their SARIF cannot be uploaded. The
+#     upload is allowed to fail for that reason; the gate still decides the build.
+
+name: xhield-scan
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write   # upload SARIF to code scanning
+  actions: read            # required by upload-sarif on private repositories
+
+env:
+  # The jar and its SHA-256, published together. Change both or neither: a URL without a matching
+  # checksum is an unverified binary running with access to your source.
+  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.0.0/xhield-scan-1.0.0.jar
+  XHIELD_SHA256: e2dc8961d9ba97d1f1bbd9ffc340283aac141354ddf34674cffdeed504c82494
+  # critical | high | medium | low | none. "none" reports everything and blocks nothing - useful
+  # for a first run against a large codebase.
+  XHIELD_FAIL_ON: high
+
+jobs:
+  scan:
+    name: xhield-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Download xhield-scan and verify its checksum
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/xhield-scan.jar" "$XHIELD_URL"
+          echo "$XHIELD_SHA256  $RUNNER_TEMP/xhield-scan.jar" | sha256sum --check --strict -
+
+      # The scan's exit status is captured, not acted on here: acting on it would skip the upload,
+      # and a failing build is exactly when the annotations matter most. The gate step acts on it.
+      - name: Scan
+        id: scan
+        run: |
+          set +e
+          java -jar "$RUNNER_TEMP/xhield-scan.jar" . \
+               --fail-on "$XHIELD_FAIL_ON" --format sarif --output xhield.sarif \
+               2> "$RUNNER_TEMP/xhield.log"
+          code=$?
+          cat "$RUNNER_TEMP/xhield.log" >&2
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          summary=$(grep '^xhield-scan: [0-9]' "$RUNNER_TEMP/xhield.log" | tail -1)
+          { echo "### xhield-scan"; echo; echo "${summary:-no summary line - see the step log}"; } >> "$GITHUB_STEP_SUMMARY"
+          exit 0
+
+      # Runs whenever a SARIF file exists, including after a failed scan: that file says
+      # executionSuccessful: false, which is what keeps a scan that did not run from reading as a
+      # clean pull request. Allowed to fail (forks, no code scanning); the gate still decides.
+      - name: Upload to code scanning
+        if: always() && hashFiles('xhield.sarif') != ''
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@1c5b675653bb5c22dbe9b12b556ec555138e09fd # v4.38.1
+        with:
+          sarif_file: xhield.sarif
+          category: xhield-scan
+
+      # The build decision. An empty exit code means the scan never ran - download or checksum
+      # failure - and that fails the build too: a scanner that did not run must never read as green.
+      - name: Gate
+        if: always()
+        env:
+          SCAN_EXIT: ${{ steps.scan.outputs.exit }}
+        run: |
+          case "$SCAN_EXIT" in
+            0) echo "xhield-scan: nothing at or above $XHIELD_FAIL_ON blocks this change." ;;
+            1) echo "::error title=xhield-scan::Findings at or above $XHIELD_FAIL_ON block this change. See the code scanning annotations."
+               exit 1 ;;
+            2) echo "::error title=xhield-scan::The scan did not complete, so nothing was concluded about this code."
+               exit 2 ;;
+            3) echo "::error title=xhield-scan::xhield-scan was invoked with arguments it could not use."
+               exit 3 ;;
+            *) echo "::error title=xhield-scan::xhield-scan did not run (download or checksum failed)."
+               exit 2 ;;
+          esac
