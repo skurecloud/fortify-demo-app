@@ -12,6 +12,12 @@
 # line numbers and the one-line snippet each finding points at. Nothing else. The scan itself makes
 # no network calls; the only other network access is the jar download below.
 #
+# Info-severity review notes are not uploaded. They are recorded findings that are not defects - an
+# endpoint a filter chain already covers, a security-relevant call with no logger nearby - and a
+# code scanning alert is a work item, so uploading them charges a triage decision for something
+# scored at nothing. The scan log states how many were left out. Add --include-info to the scan
+# command below to upload them anyway.
+#
 # Requirements:
 #   - Code scanning must be available for the repository: free on public repositories; on private
 #     ones it needs GitHub Code Security (Advanced Security). Without it the upload step fails, and
@@ -34,8 +40,8 @@ permissions:
 env:
   # The jar and its SHA-256, published together. Change both or neither: a URL without a matching
   # checksum is an unverified binary running with access to your source.
-  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.1.1/xhield-scan-1.1.1.jar
-  XHIELD_SHA256: 77908faeba98d2e58f4e7a0a0bf658d54d94255b38e078b0b97e3787848a0987
+  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.2.0/xhield-scan-1.2.0.jar
+  XHIELD_SHA256: 3bbd178e1084854c63a7dcfeb7a47062bc4baadcada5651aa3dc0e8c8b99f338
   # critical | high | medium | low | none. "none" reports everything and blocks nothing - useful
   # for a first run against a large codebase.
   XHIELD_FAIL_ON: high
@@ -118,8 +124,24 @@ jobs:
           code=$?
           cat "$RUNNER_TEMP/xhield.log" >&2
           echo "exit=$code" >> "$GITHUB_OUTPUT"
-          summary=$(grep '^xhield-scan: [0-9]' "$RUNNER_TEMP/xhield.log" | tail -1)
-          { echo "### xhield-scan"; echo; echo "${summary:-no summary line - see the step log}"; } >> "$GITHUB_STEP_SUMMARY"
+          # Matched on " finding(s)" rather than on a leading digit: the scanner writes other
+          # lines that begin with a number, and the last one of those is not the summary.
+          #
+          # "|| true" on both, and it is load-bearing. This step runs under bash -e -o pipefail, so
+          # a grep that matches nothing fails the step - and the case where nothing matches is a
+          # scan that died before printing a summary, which is precisely when the fallback text
+          # below needs to reach the reader and the gate below needs to run.
+          summary=$(grep -o 'xhield-scan: [0-9][0-9]* finding(s).*' "$RUNNER_TEMP/xhield.log" | tail -1 || true)
+          notes=$(grep -o 'xhield-scan: [0-9][0-9]* info-severity.*' "$RUNNER_TEMP/xhield.log" | tail -1 || true)
+          {
+            echo "### xhield-scan"
+            echo
+            echo "${summary:-no summary line - see the step log}"
+            if [ -n "$notes" ]; then
+              echo
+              echo "$notes"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
           exit 0
 
       # Runs whenever a SARIF file exists, including after a failed scan: that file says
