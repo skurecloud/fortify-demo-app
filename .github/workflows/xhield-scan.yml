@@ -3,9 +3,10 @@
 # Copy to .github/workflows/xhield-scan.yml in the repository to be scanned.
 #
 # What it does: downloads a pinned xhield-scan jar, verifies its checksum, scans the checkout, and
-# uploads SARIF so findings appear as code scanning annotations on the pull request. The build
-# fails when a finding at or above XHIELD_FAIL_ON is reachable or its reachability could not be
-# determined; a finding the call graph measured as unreachable is annotated but does not block.
+# uploads SARIF so findings appear as code scanning annotations on the pull request. A pull request
+# fails when it *introduces* a finding at or above XHIELD_FAIL_ON that is reachable or whose
+# reachability could not be determined. Findings the base revision already had are annotated and
+# counted, but do not fail the change that did not introduce them.
 #
 # What leaves the runner: the SARIF file, uploaded to GitHub code scanning - findings, file paths,
 # line numbers and the one-line snippet each finding points at. Nothing else. The scan itself makes
@@ -33,8 +34,8 @@ permissions:
 env:
   # The jar and its SHA-256, published together. Change both or neither: a URL without a matching
   # checksum is an unverified binary running with access to your source.
-  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.0.0/xhield-scan-1.0.0.jar
-  XHIELD_SHA256: e2dc8961d9ba97d1f1bbd9ffc340283aac141354ddf34674cffdeed504c82494
+  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.1.0/xhield-scan-1.1.0.jar
+  XHIELD_SHA256: b485ad0cabde66c94522f2a9550b87bf49e58a66f557432683274295ba13a943
   # critical | high | medium | low | none. "none" reports everything and blocks nothing - useful
   # for a first run against a large codebase.
   XHIELD_FAIL_ON: high
@@ -57,14 +58,62 @@ jobs:
           curl -fsSL --retry 3 -o "$RUNNER_TEMP/xhield-scan.jar" "$XHIELD_URL"
           echo "$XHIELD_SHA256  $RUNNER_TEMP/xhield-scan.jar" | sha256sum --check --strict -
 
+      # What the base revision already had, measured rather than remembered: the same scanner, the
+      # same working tree, the base commit checked out for the length of one scan. Nothing is
+      # committed to the repository and nothing can drift out of date.
+      #
+      # A base scan that does not complete produces no baseline, so every finding is attributed to
+      # the change. That is the wrong answer in the noisy direction, and it says so in the log;
+      # the alternative - assuming the base was clean - is the wrong answer in the silent one.
+      - name: Scan the base revision
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          head=$(git rev-parse HEAD)
+          code=99
+
+          # Reaching the base revision is allowed to fail - a shallow or rewritten history, a
+          # force-push - and the pull request is still scanned, just without a baseline.
+          if git fetch --no-tags --depth=1 origin "$BASE_SHA" \
+             && git checkout --quiet --force "$BASE_SHA"; then
+            set +e
+            java -jar "$RUNNER_TEMP/xhield-scan.jar" . \
+                 --fail-on "$XHIELD_FAIL_ON" --format sarif \
+                 --output "$RUNNER_TEMP/baseline.sarif" \
+                 2> "$RUNNER_TEMP/baseline.log" >/dev/null
+            code=$?
+            set -e
+
+            # Not allowed to fail. Every later step assumes the working tree is the pull request;
+            # if it is still the base revision, the scan below would report the base branch's
+            # findings as this change's and pass or fail on the wrong code entirely. Better to
+            # stop here than to answer confidently about a tree nobody asked about.
+            git checkout --quiet --force "$head"
+          fi
+
+          # 0 and 1 both mean the scan ran; 1 only means the base itself is over the threshold,
+          # which is the normal case and exactly what a baseline is for.
+          if [ "$code" -gt 1 ]; then
+            rm -f "$RUNNER_TEMP/baseline.sarif"
+            [ -f "$RUNNER_TEMP/baseline.log" ] && tail -5 "$RUNNER_TEMP/baseline.log" >&2
+            echo "::warning title=xhield-scan::The base revision could not be scanned, so every finding is attributed to this pull request."
+          fi
+
       # The scan's exit status is captured, not acted on here: acting on it would skip the upload,
       # and a failing build is exactly when the annotations matter most. The gate step acts on it.
       - name: Scan
         id: scan
         run: |
+          baseline=()
+          if [ -f "$RUNNER_TEMP/baseline.sarif" ]; then
+            baseline=(--baseline "$RUNNER_TEMP/baseline.sarif")
+          fi
+
           set +e
           java -jar "$RUNNER_TEMP/xhield-scan.jar" . \
                --fail-on "$XHIELD_FAIL_ON" --format sarif --output xhield.sarif \
+               "${baseline[@]}" \
                2> "$RUNNER_TEMP/xhield.log"
           code=$?
           cat "$RUNNER_TEMP/xhield.log" >&2
@@ -86,15 +135,25 @@ jobs:
 
       # The build decision. An empty exit code means the scan never ran - download or checksum
       # failure - and that fails the build too: a scanner that did not run must never read as green.
+      #
+      # Findings fail pull requests only. A push to the default branch has already been merged, so
+      # there is no change left to block; failing it would report the backlog as a broken build
+      # every day and, because GitHub reads a failed default-branch run as the tool erroring, would
+      # mark xhield-scan as "reporting errors" in the Security tab forever. A scan that could not
+      # run still fails on any trigger - that is a broken tool, and should look like one.
       - name: Gate
         if: always()
         env:
           SCAN_EXIT: ${{ steps.scan.outputs.exit }}
+          IS_PR: ${{ github.event_name == 'pull_request' }}
         run: |
           case "$SCAN_EXIT" in
             0) echo "xhield-scan: nothing at or above $XHIELD_FAIL_ON blocks this change." ;;
-            1) echo "::error title=xhield-scan::Findings at or above $XHIELD_FAIL_ON block this change. See the code scanning annotations."
-               exit 1 ;;
+            1) if [ "$IS_PR" = "true" ]; then
+                 echo "::error title=xhield-scan::This pull request introduces findings at or above $XHIELD_FAIL_ON. See the code scanning annotations."
+                 exit 1
+               fi
+               echo "::notice title=xhield-scan::Findings at or above $XHIELD_FAIL_ON are present on this branch. See the Security tab." ;;
             2) echo "::error title=xhield-scan::The scan did not complete, so nothing was concluded about this code."
                exit 2 ;;
             3) echo "::error title=xhield-scan::xhield-scan was invoked with arguments it could not use."
