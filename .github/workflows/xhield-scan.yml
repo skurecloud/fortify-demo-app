@@ -34,8 +34,8 @@ permissions:
 env:
   # The jar and its SHA-256, published together. Change both or neither: a URL without a matching
   # checksum is an unverified binary running with access to your source.
-  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.1.0/xhield-scan-1.1.0.jar
-  XHIELD_SHA256: b485ad0cabde66c94522f2a9550b87bf49e58a66f557432683274295ba13a943
+  XHIELD_URL: https://github.com/skurecloud/fortify-demo-app/releases/download/xhield-scan-v1.1.1/xhield-scan-1.1.1.jar
+  XHIELD_SHA256: 77908faeba98d2e58f4e7a0a0bf658d54d94255b38e078b0b97e3787848a0987
   # critical | high | medium | low | none. "none" reports everything and blocks nothing - useful
   # for a first run against a large codebase.
   XHIELD_FAIL_ON: high
